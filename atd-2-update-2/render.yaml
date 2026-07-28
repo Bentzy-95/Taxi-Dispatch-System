@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: airport-transfer-dispatch
+    runtime: node
+    rootDir: atd
+    plan: free # sleeps after 15 min idle, ~30-60s to wake - fine if that delay is acceptable to you
+    buildCommand: npm install --include=dev && npm run build && npm run db:migrate
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false # paste your Neon connection string here
+      - key: ACCESS_CODE
+        sync: false # choose a passcode for the dispatch board - drivers don't need it

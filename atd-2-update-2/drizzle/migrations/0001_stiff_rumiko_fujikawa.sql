@@ -1,0 +1,1 @@
+ALTER TABLE "bookings" ADD COLUMN "estimated_duration_minutes" integer;
