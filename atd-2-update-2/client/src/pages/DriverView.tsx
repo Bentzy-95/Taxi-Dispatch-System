@@ -1,6 +1,6 @@
 
 import { format } from "date-fns";
-import { Phone } from "lucide-react";
+import { Phone, Users } from "lucide-react";
 import { useState } from "react";
 import { useParams } from "wouter";
 import { trpc } from "../lib/trpc";
@@ -47,71 +47,81 @@ export default function DriverView() {
       </header>
       <main className="space-y-3 p-5">
         {jobs.length === 0 && <p className="text-sm text-muted">No active jobs right now.</p>}
-        {jobs.length > 1 && (
-          <p className="border border-signal bg-white px-3 py-2 text-xs font-semibold text-signal">
-            {jobs.length} passengers combined into one trip — pick each one up in order below.
-          </p>
-        )}
         {jobs.map((job, i) => {
           const groupColor = job.groupId ? colorForGroup(job.groupId) : null;
+          // Only announce "combined" for jobs that genuinely share a groupId with
+          // another job in this list - not just because this driver happens to
+          // have more than one job right now (e.g. two separate back-to-back trips).
+          const groupMates = job.groupId ? jobs.filter((j) => j.groupId === job.groupId) : [];
+          const isFirstOfGroup = groupMates.length > 1 && groupMates[0].id === job.id;
+          const groupTotalPassengers = groupMates.reduce((sum, j) => sum + j.passengerCount, 0);
           return (
-            <div
-              key={job.id}
-              className="space-y-2 border border-line p-4"
-              style={
-                groupColor
-                  ? { borderLeft: `6px solid ${groupColor}`, backgroundColor: `${groupColor}0d` }
-                  : undefined
-              }
-            >
-              <div className="flex items-start justify-between">
-                <div>
-                  <p className="text-xs text-muted">Stop {i + 1}</p>
-                  <p className="font-display text-lg font-700">{job.passengerName}</p>
-                  {groupColor && (
-                    <span
-                      className="mt-1 inline-block rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white"
-                      style={{ backgroundColor: groupColor }}
+            <div key={job.id}>
+              {isFirstOfGroup && (
+                <p className="mb-2 border border-signal bg-white px-3 py-2 text-xs font-semibold text-signal">
+                  {groupTotalPassengers} passengers combined into one trip — pick each one up in order below.
+                </p>
+              )}
+              <div
+                className="space-y-2 border border-line p-4"
+                style={
+                  groupColor
+                    ? { borderLeft: `6px solid ${groupColor}`, backgroundColor: `${groupColor}0d` }
+                    : undefined
+                }
+              >
+                <div className="flex items-start justify-between">
+                  <div>
+                    <p className="text-xs text-muted">Stop {i + 1}</p>
+                    <p className="font-display text-lg font-700">{job.passengerName}</p>
+                    <p className="mt-0.5 inline-flex items-center gap-1 text-xs text-muted">
+                      <Users className="h-3.5 w-3.5" /> {job.passengerCount} passenger{job.passengerCount === 1 ? "" : "s"}
+                    </p>
+                    {groupColor && (
+                      <span
+                        className="mt-1 inline-block rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white"
+                        style={{ backgroundColor: groupColor }}
+                      >
+                        Combined trip
+                      </span>
+                    )}
+                  </div>
+                  <a href={`tel:${job.passengerPhone}`} className="inline-flex items-center gap-1 text-sm font-semibold text-ink">
+                    <Phone className="h-4 w-4" /> Call
+                  </a>
+                </div>
+                <p className="text-sm">{format(new Date(job.scheduledTime), "d MMM, HH:mm")}</p>
+                <div className="space-y-0.5 text-sm">
+                  <p>
+                    <span className="text-muted">Pickup </span>
+                    {job.pickupLocation}
+                  </p>
+                  <p>
+                    <span className="text-muted">Dropoff </span>
+                    {job.dropoffLocation}
+                  </p>
+                </div>
+                <div className="flex gap-2 pt-1">
+                  {job.status === "assigned" && (
+                    <Button
+                      className="flex-1"
+                      onClick={() => updateStatus.mutate({ bookingId: job.id, status: "en_route", driverToken: token })}
+                      disabled={updateStatus.isPending}
                     >
-                      Combined trip
-                    </span>
+                      I'm on the way
+                    </Button>
+                  )}
+                  {job.status === "en_route" && (
+                    <Button
+                      className="flex-1"
+                      variant="danger"
+                      onClick={() => updateStatus.mutate({ bookingId: job.id, status: "completed", driverToken: token })}
+                      disabled={updateStatus.isPending}
+                    >
+                      Completed
+                    </Button>
                   )}
                 </div>
-                <a href={`tel:${job.passengerPhone}`} className="inline-flex items-center gap-1 text-sm font-semibold text-ink">
-                  <Phone className="h-4 w-4" /> Call
-                </a>
-              </div>
-              <p className="text-sm">{format(new Date(job.scheduledTime), "d MMM, HH:mm")}</p>
-              <div className="space-y-0.5 text-sm">
-                <p>
-                  <span className="text-muted">Pickup </span>
-                  {job.pickupLocation}
-                </p>
-                <p>
-                  <span className="text-muted">Dropoff </span>
-                  {job.dropoffLocation}
-                </p>
-              </div>
-              <div className="flex gap-2 pt-1">
-                {job.status === "assigned" && (
-                  <Button
-                    className="flex-1"
-                    onClick={() => updateStatus.mutate({ bookingId: job.id, status: "en_route", driverToken: token })}
-                    disabled={updateStatus.isPending}
-                  >
-                    I'm on the way
-                  </Button>
-                )}
-                {job.status === "en_route" && (
-                  <Button
-                    className="flex-1"
-                    variant="danger"
-                    onClick={() => updateStatus.mutate({ bookingId: job.id, status: "completed", driverToken: token })}
-                    disabled={updateStatus.isPending}
-                  >
-                    Completed
-                  </Button>
-                )}
               </div>
             </div>
           );

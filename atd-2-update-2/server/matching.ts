@@ -300,19 +300,27 @@ export function generateRecommendation(
   if (chain) return buildChainResult(chain);
 
   // --- 4. No grouping or chaining opportunity anywhere - solo assignment. ---
-  const chosen = drivers
-    .filter((d) => d.status === "available" && !excludeDriverIds.has(d.id) && d.vehicleSeats != null)
+  const availableDrivers = drivers.filter((d) => d.status === "available" && !excludeDriverIds.has(d.id));
+  const chosen = availableDrivers
+    .filter((d) => d.vehicleSeats != null)
     .filter((d) => (d.vehicleSeats as number) >= newBooking.passengerCount)
     .sort((a, b) => (a.vehicleSeats as number) - (b.vehicleSeats as number) || a.id - b.id)[0];
 
   if (!chosen) {
-    return {
-      suggestedDriverId: null,
-      suggestedVehicleId: null,
-      groupWithBookingId: null,
-      reasoning: `No available driver currently has a vehicle with enough seats for ${newBooking.passengerCount} passenger(s).`,
-      confidence: 0,
-    };
+    // Distinguish "nobody's free" from "someone's free but has no vehicle
+    // attached" from "everyone free is in too small a car" - these need
+    // completely different fixes, so a generic message just wastes the
+    // dispatcher's time guessing.
+    const withoutVehicle = availableDrivers.filter((d) => d.vehicleSeats == null).length;
+    let reasoning: string;
+    if (availableDrivers.length === 0) {
+      reasoning = `No driver is currently marked available.`;
+    } else if (withoutVehicle === availableDrivers.length) {
+      reasoning = `${withoutVehicle} driver(s) are available but have no vehicle assigned - give them one in Fleet setup so they can be matched.`;
+    } else {
+      reasoning = `No available driver currently has a vehicle with enough seats for ${newBooking.passengerCount} passenger(s).`;
+    }
+    return { suggestedDriverId: null, suggestedVehicleId: null, groupWithBookingId: null, reasoning, confidence: 0 };
   }
 
   return {
