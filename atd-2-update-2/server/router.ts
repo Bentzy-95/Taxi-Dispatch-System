@@ -281,6 +281,16 @@ export const appRouter = router({
         await markDriverAvailableIfIdle(existing.driverId);
       }
 
+      // A pending recommendation is only meaningful while the booking is
+      // still waiting to be resolved. Once it moves anywhere else - en
+      // route, completed, or back to unassigned - any leftover suggestion
+      // for it is stale and would otherwise sit there forever showing an
+      // Accept/Reject prompt on a job that's already been handled.
+      await db
+        .update(recommendations)
+        .set({ status: "rejected" })
+        .where(and(eq(recommendations.bookingId, input.bookingId), eq(recommendations.status, "pending")));
+
       broadcastToAdmins({ type: "booking_updated", bookingId: input.bookingId });
       if (existing.driverId) {
         const [driver] = await db.select().from(drivers).where(eq(drivers.id, existing.driverId));
@@ -296,6 +306,14 @@ export const appRouter = router({
         .set({ status: "assigned", driverId: input.driverId, vehicleId: input.vehicleId })
         .where(eq(bookings.id, input.bookingId));
       await db.update(drivers).set({ status: "busy" }).where(eq(drivers.id, input.driverId));
+
+      // The admin just handled this directly, overriding whatever the
+      // engine had suggested (or failed to suggest) - that recommendation
+      // is resolved now, not still pending.
+      await db
+        .update(recommendations)
+        .set({ status: "rejected" })
+        .where(and(eq(recommendations.bookingId, input.bookingId), eq(recommendations.status, "pending")));
 
       broadcastToAdmins({ type: "booking_updated", bookingId: input.bookingId });
       const [driver] = await db.select().from(drivers).where(eq(drivers.id, input.driverId));

@@ -300,7 +300,7 @@ describe("generateRecommendation - chaining a driver onto a separate follow-on j
     expect(result.reasoning).toContain("#1");
   });
 
-  it("does not chain if no estimated duration was given for the earlier job", () => {
+  it("does not use CHAIN matching without a duration estimate (though the driver may still be found genuinely free via the schedule-aware fallback)", () => {
     const dropoffRun = booking({
       id: 1,
       pickupLocation: "Chalet Edelweiss, Val Thorens",
@@ -315,16 +315,19 @@ describe("generateRecommendation - chaining a driver onto a separate follow-on j
       pickupLocation: "Geneva Airport",
       scheduledTime: new Date("2026-08-01T09:40:00Z"),
     });
-    // status "busy" (as this driver realistically would be, mid-job) so a
-    // plain solo-assignment fallback can't mask whether chaining itself
-    // correctly refused to fire without a duration estimate.
     const drivers = [driver({ id: 1, vehicleId: 10, vehicleSeats: 8, status: "busy" })];
 
     const result = generateRecommendation(newArrival, [dropoffRun], drivers);
-    expect(result.suggestedDriverId).toBeNull();
+    // Chain matching specifically requires a known duration - this must not
+    // be a chain result (chain's reasoning always names the earlier booking).
+    expect(result.reasoning).not.toContain("already dropping off");
+    // But the driver IS genuinely free by any reasonable assumption (a
+    // default-180-min job ending well before 9:40), so the schedule-aware
+    // fallback correctly still finds them rather than wrongly saying no one's available.
+    expect(result.suggestedDriverId).toBe(1);
   });
 
-  it("does not chain when the gap is outside the chain window", () => {
+  it("does not use CHAIN matching outside its window (though a genuinely large gap may still resolve via the schedule-aware fallback)", () => {
     const dropoffRun = booking({
       id: 1,
       pickupLocation: "Chalet Edelweiss, Val Thorens",
@@ -337,12 +340,13 @@ describe("generateRecommendation - chaining a driver onto a separate follow-on j
     const newArrival = booking({
       id: 2,
       pickupLocation: "Geneva Airport",
-      scheduledTime: new Date("2026-08-01T11:30:00Z"), // 2.5 hrs after free - too far out
+      scheduledTime: new Date("2026-08-01T11:30:00Z"), // 2.5 hrs after free - outside the 60-min CHAIN window
     });
     const drivers = [driver({ id: 1, vehicleId: 10, vehicleSeats: 8, status: "busy" })];
 
     const result = generateRecommendation(newArrival, [dropoffRun], drivers);
-    expect(result.suggestedDriverId).toBeNull();
+    expect(result.reasoning).not.toContain("already dropping off");
+    expect(result.suggestedDriverId).toBe(1); // still genuinely free, just not via the CHAIN path
   });
 
   it("does not chain when the new pickup is before the driver is actually free", () => {
@@ -366,7 +370,7 @@ describe("generateRecommendation - chaining a driver onto a separate follow-on j
     expect(result.suggestedDriverId).toBeNull();
   });
 
-  it("does not chain onto a mismatched location", () => {
+  it("does not use CHAIN matching onto a mismatched location (though the driver may still be found genuinely free via the schedule-aware fallback)", () => {
     const dropoffRun = booking({
       id: 1,
       pickupLocation: "Chalet Edelweiss, Val Thorens",
@@ -384,7 +388,8 @@ describe("generateRecommendation - chaining a driver onto a separate follow-on j
     const drivers = [driver({ id: 1, vehicleId: 10, vehicleSeats: 8, status: "busy" })];
 
     const result = generateRecommendation(newArrival, [dropoffRun], drivers);
-    expect(result.suggestedDriverId).toBeNull();
+    expect(result.reasoning).not.toContain("already dropping off");
+    expect(result.suggestedDriverId).toBe(1); // genuinely free timewise, chain just correctly didn't claim credit
   });
 
   it("does not chain if the vehicle doesn't have enough seats for the new party", () => {
@@ -440,6 +445,122 @@ describe("generateRecommendation - chaining a driver onto a separate follow-on j
     const result = generateRecommendation(newArrival, [sameCarShare, chainCandidate], drivers);
     expect(result.groupWithBookingId).toBe(1); // grouping wins over chaining
     expect(result.suggestedDriverId).toBe(2);
+  });
+});
+
+describe("generateRecommendation - a driver marked busy isn't automatically ruled out", () => {
+  it("assigns a busy driver to a later job when there's a genuine gap (the core fix)", () => {
+    // Driver has an early job with a real duration - clearly done well before the new one.
+    const morningJob = booking({
+      id: 1,
+      pickupLocation: "Val Thorens",
+      dropoffLocation: "Geneva Airport",
+      scheduledTime: new Date("2026-08-01T06:00:00Z"),
+      estimatedDurationMinutes: 180, // done ~9:00am
+      status: "assigned",
+      driverId: 1,
+    });
+    // A completely unrelated afternoon job, nowhere near the morning one.
+    const afternoonJob = booking({
+      id: 2,
+      pickupLocation: "Courchevel",
+      dropoffLocation: "Lyon Airport",
+      scheduledTime: new Date("2026-08-01T15:00:00Z"),
+    });
+    const drivers = [driver({ id: 1, vehicleId: 10, vehicleSeats: 8, status: "busy" })];
+
+    const result = generateRecommendation(afternoonJob, [morningJob], drivers);
+    expect(result.suggestedDriverId).toBe(1);
+    expect(result.suggestedVehicleId).toBe(10);
+    expect(result.confidence).toBeGreaterThan(0);
+  });
+
+  it("still refuses a busy driver when their existing job genuinely overlaps the new one", () => {
+    const job1 = booking({
+      id: 1,
+      pickupLocation: "Val Thorens",
+      dropoffLocation: "Geneva Airport",
+      scheduledTime: new Date("2026-08-01T06:00:00Z"),
+      estimatedDurationMinutes: 180, // occupied 6:00-9:00
+      status: "assigned",
+      driverId: 1,
+    });
+    const job2 = booking({
+      id: 2,
+      pickupLocation: "Courchevel",
+      dropoffLocation: "Lyon Airport",
+      scheduledTime: new Date("2026-08-01T08:00:00Z"), // smack in the middle of job1
+    });
+    const drivers = [driver({ id: 1, vehicleId: 10, vehicleSeats: 8, status: "busy" })];
+
+    const result = generateRecommendation(job2, [job1], drivers);
+    expect(result.suggestedDriverId).toBeNull();
+    expect(result.reasoning).toContain("schedule conflict");
+  });
+
+  it("checks ALL of a driver's active jobs, not just the most recent one", () => {
+    const morning = booking({
+      id: 1,
+      pickupLocation: "Val Thorens",
+      dropoffLocation: "Geneva Airport",
+      scheduledTime: new Date("2026-08-01T06:00:00Z"),
+      estimatedDurationMinutes: 120, // done 8:00am
+      status: "assigned",
+      driverId: 1,
+    });
+    const evening = booking({
+      id: 2,
+      pickupLocation: "Geneva Airport",
+      dropoffLocation: "Val Thorens",
+      scheduledTime: new Date("2026-08-01T18:00:00Z"),
+      estimatedDurationMinutes: 180,
+      status: "assigned",
+      driverId: 1,
+    });
+    // Sits comfortably in the gap between the two existing jobs.
+    const midday = booking({
+      id: 3,
+      pickupLocation: "Courchevel",
+      dropoffLocation: "Meribel",
+      scheduledTime: new Date("2026-08-01T12:00:00Z"),
+    });
+    const drivers = [driver({ id: 1, vehicleId: 10, vehicleSeats: 8, status: "busy" })];
+
+    const result = generateRecommendation(midday, [morning, evening], drivers);
+    expect(result.suggestedDriverId).toBe(1);
+  });
+
+  it("prefers a genuinely idle driver over a busy-but-free one when both fit", () => {
+    const morningJob = booking({
+      id: 1,
+      pickupLocation: "Val Thorens",
+      dropoffLocation: "Geneva Airport",
+      scheduledTime: new Date("2026-08-01T06:00:00Z"),
+      estimatedDurationMinutes: 180,
+      status: "assigned",
+      driverId: 1,
+    });
+    const newJob = booking({
+      id: 2,
+      pickupLocation: "Courchevel",
+      dropoffLocation: "Lyon Airport",
+      scheduledTime: new Date("2026-08-01T15:00:00Z"),
+    });
+    const drivers = [
+      driver({ id: 1, vehicleId: 10, vehicleSeats: 8, status: "busy" }), // free, but technically busy elsewhere
+      driver({ id: 2, vehicleId: 20, vehicleSeats: 8, status: "available" }), // truly idle
+    ];
+
+    const result = generateRecommendation(newJob, [morningJob], drivers);
+    expect(result.suggestedDriverId).toBe(2); // the idle one, simpler choice, all else equal
+  });
+
+  it("never assigns an offline driver even with a wide-open schedule", () => {
+    const newJob = booking({ id: 1, pickupLocation: "A", dropoffLocation: "B", scheduledTime: new Date("2026-08-01T12:00:00Z") });
+    const drivers = [driver({ id: 1, vehicleId: 10, vehicleSeats: 8, status: "offline" })];
+
+    const result = generateRecommendation(newJob, [], drivers);
+    expect(result.suggestedDriverId).toBeNull();
   });
 });
 

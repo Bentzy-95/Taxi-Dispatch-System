@@ -18,6 +18,17 @@ export const GROUPING_WINDOW_MINUTES = 30;
  * is too tight or too loose for how your routes actually run. */
 export const CHAIN_WINDOW_MINUTES = 60;
 
+/** Assumed length of a job when no estimatedDurationMinutes was given.
+ * Used purely to figure out whether a driver genuinely has a scheduling
+ * conflict - "busy" should mean "actually occupied at that time," not
+ * "has any job at all, ever, regardless of when." */
+export const DEFAULT_TRIP_DURATION_MINUTES = 180;
+
+/** Minimum gap required between the end of one job and the start of the
+ * next for the same driver - a little breathing room, not back-to-back
+ * with zero margin. */
+export const SCHEDULE_BUFFER_MINUTES = 30;
+
 export interface MatchableBooking {
   id: number;
   passengerCount: number;
@@ -227,6 +238,34 @@ function formatTime(d: Date): string {
   return d.toISOString().slice(11, 16) + " UTC";
 }
 
+/** Start/end of a job's real-world occupation of a driver, using its
+ * actual duration if known, or the default assumption otherwise. */
+function jobWindow(b: MatchableBooking): { start: Date; end: Date } {
+  const duration = b.estimatedDurationMinutes ?? DEFAULT_TRIP_DURATION_MINUTES;
+  const start = b.scheduledTime;
+  return { start, end: new Date(start.getTime() + duration * 60000) };
+}
+
+/**
+ * Whether assigning this driver to newBooking would genuinely clash with
+ * any job they're already committed to - not "are they marked busy" but
+ * "would two jobs actually overlap in time." A driver dropping someone
+ * off at 9am and free the rest of the day should still be assignable to
+ * something at 3pm even though their status flag currently says busy.
+ */
+function hasScheduleConflict(newBooking: MatchableBooking, driverId: number, existingBookings: MatchableBooking[]): boolean {
+  const driversJobs = existingBookings.filter(
+    (b) => b.driverId === driverId && (b.status === "assigned" || b.status === "en_route") && b.id !== newBooking.id,
+  );
+  const newW = jobWindow(newBooking);
+  const bufferedStart = new Date(newW.start.getTime() - SCHEDULE_BUFFER_MINUTES * 60000);
+  const bufferedEnd = new Date(newW.end.getTime() + SCHEDULE_BUFFER_MINUTES * 60000);
+  return driversJobs.some((job) => {
+    const w = jobWindow(job);
+    return w.start < bufferedEnd && w.end > bufferedStart; // any overlap, buffer included
+  });
+}
+
 function buildChainResult(match: ChainCandidateMatch): MatchResult {
   const { candidate, driver, freeAt, gapMinutes } = match;
   const confidence = Math.max(0.55, 0.88 - gapMinutes / (CHAIN_WINDOW_MINUTES * 2));
@@ -300,34 +339,54 @@ export function generateRecommendation(
   if (chain) return buildChainResult(chain);
 
   // --- 4. No grouping or chaining opportunity anywhere - solo assignment. ---
-  const availableDrivers = drivers.filter((d) => d.status === "available" && !excludeDriverIds.has(d.id));
-  const chosen = availableDrivers
+  // "Busy" alone no longer rules a driver out - only an actual time clash
+  // does. A driver free from 10am to 6pm should still be assignable to a
+  // 2pm job even though they're marked busy on something else right now.
+  const candidateDrivers = drivers.filter((d) => !excludeDriverIds.has(d.id) && d.status !== "offline");
+  const genuinelyFree = candidateDrivers.filter(
+    (d) => d.status === "available" || !hasScheduleConflict(newBooking, d.id, existingBookings),
+  );
+  const chosen = genuinelyFree
     .filter((d) => d.vehicleSeats != null)
     .filter((d) => (d.vehicleSeats as number) >= newBooking.passengerCount)
-    .sort((a, b) => (a.vehicleSeats as number) - (b.vehicleSeats as number) || a.id - b.id)[0];
+    // Prefer a driver who's actually idle right now over one who's mid-job
+    // elsewhere but has a genuine gap - simpler for dispatch even when both work.
+    .sort(
+      (a, b) =>
+        Number(a.status !== "available") - Number(b.status !== "available") ||
+        (a.vehicleSeats as number) - (b.vehicleSeats as number) ||
+        a.id - b.id,
+    )[0];
 
   if (!chosen) {
     // Distinguish "nobody's free" from "someone's free but has no vehicle
     // attached" from "everyone free is in too small a car" - these need
     // completely different fixes, so a generic message just wastes the
     // dispatcher's time guessing.
-    const withoutVehicle = availableDrivers.filter((d) => d.vehicleSeats == null).length;
+    const withoutVehicle = genuinelyFree.filter((d) => d.vehicleSeats == null).length;
     let reasoning: string;
-    if (availableDrivers.length === 0) {
-      reasoning = `No driver is currently marked available.`;
-    } else if (withoutVehicle === availableDrivers.length) {
-      reasoning = `${withoutVehicle} driver(s) are available but have no vehicle assigned - give them one in Fleet setup so they can be matched.`;
+    if (candidateDrivers.length === 0) {
+      reasoning = `No driver is available or on staff.`;
+    } else if (genuinelyFree.length === 0) {
+      reasoning = `Every driver has a genuine schedule conflict at this time (within ${SCHEDULE_BUFFER_MINUTES} min of another job).`;
+    } else if (withoutVehicle === genuinelyFree.length) {
+      reasoning = `${withoutVehicle} driver(s) are free at this time but have no vehicle assigned - give them one in Fleet setup so they can be matched.`;
     } else {
-      reasoning = `No available driver currently has a vehicle with enough seats for ${newBooking.passengerCount} passenger(s).`;
+      reasoning = `No driver free at this time currently has a vehicle with enough seats for ${newBooking.passengerCount} passenger(s).`;
     }
     return { suggestedDriverId: null, suggestedVehicleId: null, groupWithBookingId: null, reasoning, confidence: 0 };
   }
+
+  const reasoning =
+    chosen.status === "available"
+      ? `No other booking to combine with in the same ${GROUPING_WINDOW_MINUTES}-minute window. Assigning the smallest available vehicle that fits ${newBooking.passengerCount} passenger(s) (${chosen.vehicleSeats} seats).`
+      : `This driver has another job around this time but is genuinely free for this one too (no real schedule clash) - assigning them rather than pulling in someone else.`;
 
   return {
     suggestedDriverId: chosen.id,
     suggestedVehicleId: chosen.vehicleId,
     groupWithBookingId: null,
-    reasoning: `No other booking to combine with in the same ${GROUPING_WINDOW_MINUTES}-minute window. Assigning the smallest available vehicle that fits ${newBooking.passengerCount} passenger(s) (${chosen.vehicleSeats} seats).`,
-    confidence: 0.75,
+    reasoning,
+    confidence: chosen.status === "available" ? 0.75 : 0.65,
   };
 }
